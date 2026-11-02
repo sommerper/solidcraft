@@ -112,11 +112,12 @@ and editing keep their existing modifiers.
 
 ### Sketch modifiers
 
-While drawing or dragging a sketch point:
+While drawing or dragging sketch geometry:
 
 | Keys | Action |
 |---|---|
 | Ctrl/Cmd or Alt/Option (default) | suppress auto-snap for that gesture |
+| Ctrl/Cmd when pressing on a curve's edge | change its shape: a circle's or arc's radius, a conic's fullness; a rectangle's side slides with the pointer |
 | Shift | prefer a line midpoint when targeting (skips a curve-curve crossing) |
 | Shift, while drawing a Two-Point or Center Rectangle | make the rectangle a square: the second corner moves to the larger of the two distances, and the sketch gets an Equal constraint between two sides, so one dimension defines it; off by default, turn it on in Preferences › Sketch |
 

@@ -6,7 +6,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2
 use serde_json::json;
 use solidcore_record::{Plane, Vec2, Vec3};
 use solidcraft_engine::geom::prelude::*;
-use solidcraft_engine::sketch::CurveKind;
+use solidcraft_engine::sketch::{ConstraintKind, CurveKind};
 use solidcraft_engine::view::{GridFade, GridPlane, colors, grid_ext, grid_lines, grid_plane, grid_step, sketch_lines_with_sampler};
 use solidcraft_engine::{SectionPlane, Sel};
 use solidcraft_viewport::{Camera, Mat4, Rgb};
@@ -321,6 +321,9 @@ pub struct ViewportState {
     /// A sketch point or curve being dragged (its id, the undo depth when the drag began: the
     /// whole drag is one undo step, and for a curve where it was last under the cursor).
     pub point_drag: Option<(String, usize, Option<Vec2>, Vec2, bool)>,
+    /// Whether Ctrl (Cmd) was held when `point_drag` began: a curve grabbed on its edge then
+    /// drags as the engine drags it (`EdgeDrag::Engine`), until the release.
+    pub(crate) reshape_drag: bool,
     /// Checkpoint and source for a cancellable whole-text drag.
     pub(crate) text_drag: Option<(u64, String)>,
     /// A part that joints place, being dragged.
@@ -7063,6 +7066,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                 }
                 Some(Hit::SketchCurve { sketch, id, .. } | Hit::SketchMidpoint { sketch, id, .. }) if Some(sketch) == active => {
                     app.viewport.point_drag = on_plane(app, a).map(|q| (id, app.session.undo.len(), Some(q), Vec2::ZERO, false));
+                    app.viewport.reshape_drag = held_mods.primary;
                 }
                 _ => {}
             }
@@ -7095,14 +7099,32 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         {
             q = if mirrored { offset - q } else { q + offset };
             let from = grab.map_or(q, |point| if mirrored { offset - point } else { point + offset });
-            let with = dragged_with(app, &id);
+            let mut with = dragged_with(app, &id);
+            // A curve grabbed on its edge alone: see `EdgeDrag`. With Ctrl (Cmd), or with the
+            // preference off, the engine drags it as it is: a circle's edge changes its radius, a
+            // line slides freely.
+            let mut snaps = true;
+            if with.is_empty() && !app.viewport.reshape_drag && app.preferences.sketch_edge_drag_moves {
+                match edge_drag(app, &id) {
+                    // Moved whole, as a group of itself.
+                    EdgeDrag::Whole => with.push(id.clone()),
+                    // No snapping: a snap (one lining the side up with where it began, too)
+                    // pulls it along its length, and the shape with it.
+                    // ponytail: snaps off for these drags; snap along `n` only if missed.
+                    EdgeDrag::Across(n) => {
+                        q = from + n * n.dot(q - from);
+                        snaps = false;
+                    }
+                    EdgeDrag::Engine => {}
+                }
+            }
             // Snap the dragged point (or the line's ends) to other geometry, like drawing.
             let snap = {
                 let st = crate::open_meshing::shown_world(app);
                 app.session.active_sketch.and_then(|s| st.sketch(s)).and_then(|ss| {
                     let sk = &ss.sketch;
                     let (own, exclude) = crate::drag_snap::moving_points(sk, std::iter::once(id.as_str()).chain(with.iter().map(String::as_str)));
-                    if own.iter().any(|&p| sk.point_locked(p)) {
+                    if !snaps || own.iter().any(|&p| sk.point_locked(p)) {
                         return crate::drag_snap::find(sk, &[], &[], 0.0);
                     }
                     let a = proj.to_screen(ss.plane.to_world(q))?;
@@ -7845,7 +7867,7 @@ fn dragged_with(app: &SolveApp, id: &str) -> Vec<String> {
     }
     let rest: Vec<String> = selected().filter(|s| *s != id).map(str::to_owned).collect();
     // A curve's own points, selected with it by a window, are not a group: a circle grabbed on
-    // its edge still takes its radius from the drag.
+    // its edge drags as it would alone.
     let st = crate::open_meshing::session_world(&app.session);
     let own: Vec<&str> = app
         .session
@@ -7861,6 +7883,42 @@ fn dragged_with(app: &SolveApp, id: &str) -> Vec<String> {
         return Vec::new();
     }
     rest
+}
+
+/// How a curve of the active sketch grabbed on its edge, alone and without Ctrl, follows the
+/// pointer: an edge of a shape moves only itself, a curve on its own moves whole.
+enum EdgeDrag {
+    /// A circle or an ellipse, or an arc or conic with a free end: it moves whole instead of
+    /// changing its radius (a conic its fullness).
+    Whole,
+    /// A horizontal or vertical line joined at both ends, a side of a rectangle: it moves only
+    /// across itself, along this normal. Along its length it would carry the shape with it.
+    /// ponytail: held level only; a turned rectangle (sides perpendicular) slides as before.
+    Across(Vec2),
+    /// As the engine drags it: any other line or a spline slides (one that can turn, a polygon's
+    /// side or a linkage's bar, turns to follow the pointer), an arc or conic joined at both ends
+    /// changes its radius (fullness), linked geometry moves with its link.
+    Engine,
+}
+
+fn edge_drag(app: &SolveApp, id: &str) -> EdgeDrag {
+    let st = crate::open_meshing::session_world(&app.session);
+    let Some(sk) = app.session.active_sketch.and_then(|s| st.sketch(s)).map(|ss| &ss.sketch) else { return EdgeDrag::Engine };
+    let Some((ci, c)) = sk.curve_index(id).and_then(|ci| Some((ci, sk.curves.get(ci)?))) else { return EdgeDrag::Engine };
+    // Linked geometry (a letter of a text) moves with its link.
+    if c.link.is_some() {
+        return EdgeDrag::Engine;
+    }
+    let level =
+        |ci: usize| sk.constraints.iter().any(|k| matches!(k.kind, ConstraintKind::Horizontal { l } | ConstraintKind::Vertical { l } if l == ci));
+    match c.kind {
+        CurveKind::Line { a, b } if level(ci) && sk.ends_joined(ci) => {
+            sk.point(a).zip(sk.point(b)).and_then(|(a, b)| (b - a).normalized()).map_or(EdgeDrag::Engine, |u| EdgeDrag::Across(u.perp()))
+        }
+        CurveKind::Circle { .. } | CurveKind::Ellipse { .. } => EdgeDrag::Whole,
+        CurveKind::Arc { .. } | CurveKind::Conic { .. } if !sk.ends_joined(ci) => EdgeDrag::Whole,
+        _ => EdgeDrag::Engine,
+    }
 }
 
 /// What a click on `sel` picks: its pieces ([`grouped_selection`]), and for a letter of a sketch
